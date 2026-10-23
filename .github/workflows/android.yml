@@ -1,0 +1,721 @@
+name: Build Android Chess Analyzer
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  STOCKFISH_TAG: sf_17.1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Creates the entire Android project from scratch, so the repo only needs this one file
+      - name: Generate Android project files
+        run: |
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'GEN_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ChessAnalyzer"
+          include(":app")
+          GEN_EOF
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'GEN_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          GEN_EOF
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'GEN_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          GEN_EOF
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'GEN_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.maxi.chessanalyzer"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.maxi.chessanalyzer"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += "arm64-v8a" }
+              }
+
+              buildFeatures { compose = true }
+
+              // Stockfish is shipped as libstockfish.so and must be extracted to disk to be executable
+              packaging { jniLibs { useLegacyPackaging = true } }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.03"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("com.github.bhlangonijr:chesslib:1.3.4")
+          }
+          GEN_EOF
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'GEN_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <!-- No INTERNET permission on purpose: everything runs offline -->
+              <application
+                  android:label="Chess Analyzer"
+                  android:extractNativeLibs="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          GEN_EOF
+          mkdir -p "$(dirname app/src/main/java/com/maxi/chessanalyzer/Engine.kt)"
+          cat > app/src/main/java/com/maxi/chessanalyzer/Engine.kt <<'GEN_EOF'
+          package com.maxi.chessanalyzer
+
+          import android.content.Context
+          import java.io.BufferedReader
+          import java.io.BufferedWriter
+          import java.io.Closeable
+          import java.io.File
+
+          /** One engine line. cp is from the side-to-move's view; mate > 0 means side to move mates in N. */
+          data class EngineLine(val cp: Int, val mate: Int?, val pv: List<String>)
+
+          /** Talks UCI to the bundled Stockfish binary (libstockfish.so in the native lib dir). */
+          class Engine(context: Context) : Closeable {
+              private val proc: Process
+              private val out: BufferedWriter
+              private val inp: BufferedReader
+
+              init {
+                  val exe = File(context.applicationInfo.nativeLibraryDir, "libstockfish.so")
+                  proc = ProcessBuilder(exe.absolutePath).redirectErrorStream(true).start()
+                  out = proc.outputStream.bufferedWriter()
+                  inp = proc.inputStream.bufferedReader()
+                  send("uci"); waitFor("uciok")
+                  send("setoption name MultiPV value 2")
+                  send("setoption name Threads value ${Runtime.getRuntime().availableProcessors().coerceIn(1, 4)}")
+                  send("setoption name Hash value 64")
+                  send("isready"); waitFor("readyok")
+              }
+
+              private fun send(s: String) { out.write(s); out.newLine(); out.flush() }
+
+              private fun waitFor(token: String) {
+                  while (true) {
+                      val l = inp.readLine() ?: error("Engine stopped")
+                      if (l.trim() == token) return
+                  }
+              }
+
+              fun analyze(fen: String, depth: Int): List<EngineLine> {
+                  send("position fen $fen")
+                  send("go depth $depth")
+                  val lines = HashMap<Int, EngineLine>()
+                  while (true) {
+                      val l = inp.readLine() ?: error("Engine stopped")
+                      if (l.startsWith("bestmove")) break
+                      if (!l.startsWith("info") || " pv " !in l || " score " !in l) continue
+                      if ("lowerbound" in l || "upperbound" in l) continue
+                      val t = l.split(' ')
+                      val mpvIdx = t.indexOf("multipv")
+                      val mpv = if (mpvIdx >= 0) t[mpvIdx + 1].toInt() else 1
+                      val si = t.indexOf("score")
+                      val kind = t[si + 1]
+                      val v = t[si + 2].toInt()
+                      val pv = t.drop(t.indexOf("pv") + 1)
+                      lines[mpv] = if (kind == "mate")
+                          EngineLine(if (v > 0) 10000 - v else -10000 - v, v, pv)
+                      else
+                          EngineLine(v.coerceIn(-9000, 9000), null, pv)
+                  }
+                  return lines.toSortedMap().values.toList()
+              }
+
+              override fun close() {
+                  try { send("quit") } catch (_: Exception) {}
+                  proc.destroy()
+              }
+          }
+          GEN_EOF
+          mkdir -p "$(dirname app/src/main/java/com/maxi/chessanalyzer/Analyzer.kt)"
+          cat > app/src/main/java/com/maxi/chessanalyzer/Analyzer.kt <<'GEN_EOF'
+          package com.maxi.chessanalyzer
+
+          import com.github.bhlangonijr.chesslib.Board
+          import com.github.bhlangonijr.chesslib.Piece
+          import com.github.bhlangonijr.chesslib.PieceType
+          import com.github.bhlangonijr.chesslib.Side
+          import com.github.bhlangonijr.chesslib.move.Move
+          import com.github.bhlangonijr.chesslib.move.MoveList
+          import kotlin.math.abs
+          import kotlin.math.exp
+
+          enum class Cls(val symbol: String, val label: String, val color: Long) {
+              BRILLIANT("!!", "Brilliant", 0xFF26C2A3),
+              GREAT("!", "Great", 0xFF5C8BB0),
+              BEST("★", "Best", 0xFF81B64C),
+              EXCELLENT("", "Excellent", 0xFF81B64C),
+              GOOD("", "Good", 0xFF95B776),
+              INACCURACY("?!", "Inaccuracy", 0xFFF7C631),
+              MISTAKE("?", "Mistake", 0xFFE58F2A),
+              BLUNDER("??", "Blunder", 0xFFCA3431),
+          }
+
+          data class MoveInfo(
+              val san: String,
+              val uci: String,
+              val whiteMoved: Boolean,
+              val moveNumber: Int,
+              val fenAfter: String,
+              val cls: Cls,
+              val explanation: String,
+              val evalWhiteCp: Int,
+              val evalText: String,
+          )
+
+          data class GameAnalysis(
+              val white: String,
+              val black: String,
+              val startFen: String,
+              val startEvalCp: Int,
+              val moves: List<MoveInfo>,
+              val accuracyWhite: Double,
+              val accuracyBlack: Double,
+              val countsWhite: Map<Cls, Int>,
+              val countsBlack: Map<Cls, Int>,
+          )
+
+          object Analyzer {
+              private const val START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+              fun winProb(cp: Int): Double = 1.0 / (1.0 + exp(-0.00368208 * cp))
+
+              private fun value(p: Piece): Int = when (p.pieceType) {
+                  PieceType.PAWN -> 1
+                  PieceType.KNIGHT, PieceType.BISHOP -> 3
+                  PieceType.ROOK -> 5
+                  PieceType.QUEEN -> 9
+                  else -> 0
+              }
+
+              private fun name(p: Piece): String = p.pieceType?.name?.lowercase() ?: "piece"
+
+              private fun uciToSan(fen: String, uci: String): String = try {
+                  val b = Board(); b.loadFromFen(fen)
+                  val ml = MoveList(fen)
+                  ml.add(Move(uci, b.sideToMove))
+                  ml.toSanArray()[0]
+              } catch (e: Exception) { uci }
+
+              private fun evalPos(engine: Engine, fen: String, depth: Int): List<EngineLine> {
+                  val b = Board(); b.loadFromFen(fen)
+                  if (b.isMated) return listOf(EngineLine(-10000, 0, emptyList()))
+                  if (b.isStaleMate || b.isDraw) return listOf(EngineLine(0, null, emptyList()))
+                  return engine.analyze(fen, depth)
+              }
+
+              private fun fmt(cpWhite: Int, mateWhite: Int?): String = when {
+                  mateWhite != null && mateWhite == 0 -> "#"
+                  mateWhite != null -> (if (mateWhite < 0) "-" else "") + "M" + abs(mateWhite)
+                  else -> String.format("%+.1f", cpWhite / 100.0)
+              }
+
+              private class Parsed(val white: String, val black: String, val fen: String?, val sans: List<String>)
+
+              private fun parse(pgn: String): Parsed {
+                  fun hdr(k: String) = Regex("""\[$k\s+"([^"]*)"\]""").find(pgn)?.groupValues?.get(1)
+                  var t = pgn.replace(Regex("""(?m)^\s*\[.*\]\s*$"""), " ")
+                  t = t.replace(Regex("""\{[^}]*\}"""), " ").replace(Regex(""";[^\n]*"""), " ")
+                  var prev: String
+                  do { prev = t; t = t.replace(Regex("""\([^()]*\)"""), " ") } while (t != prev)
+                  t = t.replace(Regex("""\$\d+"""), " ").replace(Regex("""\d+\.+"""), " ")
+                  val results = setOf("1-0", "0-1", "1/2-1/2", "*")
+                  val sans = t.split(Regex("\\s+"))
+                      .map { it.trim().replace(Regex("[!?]+$"), "") }
+                      .filter { it.isNotEmpty() && it !in results }
+                      .map { it.replace("0-0-0", "O-O-O").replace("0-0", "O-O") }
+                  return Parsed(hdr("White") ?: "White", hdr("Black") ?: "Black", hdr("FEN"), sans)
+              }
+
+              fun analyze(engine: Engine, pgn: String, depth: Int, onProgress: (Int, Int) -> Unit): GameAnalysis {
+                  val p = parse(pgn)
+                  if (p.sans.isEmpty()) throw IllegalArgumentException("No moves found in that PGN.")
+
+                  // Replay the game
+                  val board = Board()
+                  if (p.fen != null) board.loadFromFen(p.fen)
+                  val startFen = board.fen
+                  val fens = mutableListOf(startFen)
+                  val moves = mutableListOf<Move>()
+                  for (s in p.sans) {
+                      val ok = try { board.doMove(s) } catch (e: Exception) { false }
+                      if (!ok) throw IllegalArgumentException("Couldn't read the move \"$s\" (move ${moves.size / 2 + 1}).")
+                      val m = board.undoMove()
+                      board.doMove(m)
+                      moves.add(m)
+                      fens.add(board.fen)
+                  }
+
+                  // Evaluate every position once
+                  val ev = fens.mapIndexed { i, fen ->
+                      onProgress(i + 1, fens.size)
+                      evalPos(engine, fen, depth)
+                  }
+
+                  val infos = mutableListOf<MoveInfo>()
+                  val accSum = doubleArrayOf(0.0, 0.0)
+                  val accCnt = intArrayOf(0, 0)
+                  val counts = arrayOf(HashMap<Cls, Int>(), HashMap<Cls, Int>())
+                  var lastCaptureSquare: String? = null
+
+                  for (i in moves.indices) {
+                      val lines = ev[i]
+                      val best = lines[0]
+                      val after = ev[i + 1][0]
+                      val move = moves[i]
+                      val uci = move.toString().lowercase()
+                      val san = p.sans[i]
+
+                      val before = Board(); before.loadFromFen(fens[i])
+                      val whiteMoved = before.sideToMove == Side.WHITE
+                      val side = if (whiteMoved) 0 else 1
+
+                      val matched = lines.firstOrNull { it.pv.firstOrNull()?.lowercase() == uci }
+                      val isBest = best.pv.firstOrNull()?.lowercase() == uci
+                      val playedCp = matched?.cp ?: -after.cp
+                      val playedMate: Int? = if (matched != null) matched.mate else after.mate?.let { -it }
+
+                      val wpBest = winProb(best.cp)
+                      val wpPlayed = winProb(playedCp)
+                      val loss = (wpBest - wpPlayed).coerceAtLeast(0.0)
+
+                      // Material-sacrifice detection (for "Brilliant")
+                      val moved = before.getPiece(move.from)
+                      val captured = before.getPiece(move.to)
+                      val afterBoard = Board(); afterBoard.loadFromFen(fens[i + 1])
+                      val opp = if (whiteMoved) Side.BLACK else Side.WHITE
+                      val attacked = afterBoard.squareAttackedBy(move.to, opp) != 0L
+                      val sacrificed = attacked && value(moved) >= 3 &&
+                          value(moved) - (if (captured == Piece.NONE) 0 else value(captured)) >= 3
+                      val toSq = move.to.toString().lowercase()
+                      val isRecapture = lastCaptureSquare == toSq
+
+                      val gap = if (lines.size > 1) wpBest - winProb(lines[1].cp) else 0.0
+                      val cls = when {
+                          loss >= 0.20 -> Cls.BLUNDER
+                          loss >= 0.10 -> Cls.MISTAKE
+                          loss >= 0.05 -> Cls.INACCURACY
+                          loss < 0.02 && sacrificed && matched != null && wpBest < 0.80 && wpPlayed > 0.45 && !isRecapture -> Cls.BRILLIANT
+                          isBest && gap >= 0.15 && wpBest < 0.95 && !isRecapture -> Cls.GREAT
+                          isBest -> Cls.BEST
+                          loss < 0.02 -> Cls.EXCELLENT
+                          else -> Cls.GOOD
+                      }
+
+                      val bestSan = best.pv.firstOrNull()?.let { uciToSan(fens[i], it) } ?: ""
+                      val evalBeforeW = if (whiteMoved) best.cp else -best.cp
+                      val evalAfterW = if (whiteMoved) playedCp else -playedCp
+                      val mateAfterW = playedMate?.let { if (whiteMoved) it else -it }
+                      val mateBeforeW = best.mate?.let { if (whiteMoved) it else -it }
+                      val swing = "Eval: ${fmt(evalBeforeW, mateBeforeW)} → ${fmt(evalAfterW, mateAfterW)}"
+
+                      val explanation = when (cls) {
+                          Cls.BRILLIANT -> "Brilliant! You gave up your ${name(moved)} on $toSq, but the engine confirms the idea works out."
+                          Cls.GREAT -> "Great move! It was the key move here — the alternatives were much worse."
+                          Cls.BEST -> "Best move — the engine's top choice."
+                          Cls.EXCELLENT -> "Excellent — nearly as strong as the best move ($bestSan)."
+                          Cls.GOOD -> "Good move. The engine slightly preferred $bestSan."
+                          else -> {
+                              val head = "$san is ${if (cls == Cls.BLUNDER) "a blunder" else if (cls == Cls.MISTAKE) "a mistake" else "an inaccuracy"}."
+                              val reason = when {
+                                  best.mate != null && best.mate > 0 && !(playedMate != null && playedMate > 0) ->
+                                      "You missed a forced checkmate in ${best.mate}."
+                                  playedMate != null && playedMate < 0 ->
+                                      "This allows checkmate in ${-playedMate}."
+                                  else -> {
+                                      val reply = after.pv.firstOrNull()
+                                      val replyCap = reply?.let {
+                                          try { afterBoard.getPiece(Move(it, afterBoard.sideToMove).to) } catch (e: Exception) { Piece.NONE }
+                                      } ?: Piece.NONE
+                                      val bestCap = best.pv.firstOrNull()?.let {
+                                          try { before.getPiece(Move(it, before.sideToMove).to) } catch (e: Exception) { Piece.NONE }
+                                      } ?: Piece.NONE
+                                      when {
+                                          replyCap != Piece.NONE ->
+                                              "Now the opponent can play ${uciToSan(fens[i + 1], reply!!)} and win your ${name(replyCap)}."
+                                          bestCap != Piece.NONE ->
+                                              "You missed the chance to win the ${name(bestCap)} on ${best.pv[0].substring(2, 4)}."
+                                          else -> "The position got worse than it needed to."
+                                      }
+                                  }
+                              }
+                              "$head Better was $bestSan. $reason"
+                          }
+                      } + "\n" + swing
+
+                      lastCaptureSquare = if (captured != Piece.NONE) toSq else null
+
+                      val acc = (103.1668 * exp(-0.04354 * loss * 100) - 3.1669).coerceIn(0.0, 100.0)
+                      accSum[side] += acc; accCnt[side]++
+                      counts[side][cls] = (counts[side][cls] ?: 0) + 1
+
+                      infos.add(
+                          MoveInfo(
+                              san = san, uci = uci, whiteMoved = whiteMoved,
+                              moveNumber = before.moveCounter,
+                              fenAfter = fens[i + 1], cls = cls, explanation = explanation,
+                              evalWhiteCp = evalAfterW, evalText = fmt(evalAfterW, mateAfterW),
+                          )
+                      )
+                  }
+
+                  val startBoard = Board(); startBoard.loadFromFen(startFen)
+                  val startW = if (startBoard.sideToMove == Side.WHITE) ev[0][0].cp else -ev[0][0].cp
+                  return GameAnalysis(
+                      white = p.white, black = p.black, startFen = startFen, startEvalCp = startW,
+                      moves = infos,
+                      accuracyWhite = if (accCnt[0] > 0) accSum[0] / accCnt[0] else 0.0,
+                      accuracyBlack = if (accCnt[1] > 0) accSum[1] / accCnt[1] else 0.0,
+                      countsWhite = counts[0], countsBlack = counts[1],
+                  )
+              }
+          }
+          GEN_EOF
+          mkdir -p "$(dirname app/src/main/java/com/maxi/chessanalyzer/MainActivity.kt)"
+          cat > app/src/main/java/com/maxi/chessanalyzer/MainActivity.kt <<'GEN_EOF'
+          package com.maxi.chessanalyzer
+
+          import android.graphics.Paint
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+          import androidx.compose.ui.graphics.nativeCanvas
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          Surface(Modifier.fillMaxSize()) { App() }
+                      }
+                  }
+              }
+          }
+
+          @OptIn(ExperimentalLayoutApi::class)
+          @Composable
+          fun App() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var pgn by remember { mutableStateOf("") }
+              var status by remember { mutableStateOf<String?>(null) }
+              var busy by remember { mutableStateOf(false) }
+              var game by remember { mutableStateOf<GameAnalysis?>(null) }
+              var sel by remember { mutableStateOf(-1) }
+
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                  if (uri != null) {
+                      try {
+                          pgn = ctx.contentResolver.openInputStream(uri)!!.bufferedReader().use { it.readText() }
+                      } catch (e: Exception) { status = "Couldn't open file: ${e.message}" }
+                  }
+              }
+
+              fun run() {
+                  busy = true; game = null; sel = -1; status = "Starting engine…"
+                  scope.launch {
+                      try {
+                          val r = withContext(Dispatchers.Default) {
+                              Engine(ctx).use { e ->
+                                  Analyzer.analyze(e, pgn, 14) { d, t -> status = "Analyzing position $d of $t…" }
+                              }
+                          }
+                          game = r; status = null
+                      } catch (e: Exception) {
+                          status = "Error: ${e.message}"
+                      } finally { busy = false }
+                  }
+              }
+
+              Column(
+                  Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()
+                      .verticalScroll(rememberScrollState()).padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(12.dp),
+              ) {
+                  val g = game
+                  if (g == null) {
+                      Text("Chess Analyzer", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                      Text("Paste a PGN or open a .pgn file. Everything runs offline on your phone with Stockfish.")
+                      OutlinedTextField(
+                          value = pgn, onValueChange = { pgn = it },
+                          modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp),
+                          label = { Text("PGN") },
+                      )
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Button(onClick = { run() }, enabled = !busy && pgn.isNotBlank()) { Text("Analyze") }
+                          OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !busy) { Text("Open file") }
+                      }
+                      status?.let { Text(it) }
+                      if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                  } else {
+                      val cur = if (sel >= 0) g.moves[sel] else null
+                      val fen = cur?.fenAfter ?: g.startFen
+                      val evalCp = cur?.evalWhiteCp ?: g.startEvalCp
+
+                      Text("${g.white} vs ${g.black}", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                      Board(fen, cur?.uci)
+                      EvalBar(evalCp)
+
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                          Button(onClick = { sel = -1 }) { Text("⏮") }
+                          Button(onClick = { if (sel >= 0) sel-- }) { Text("◀") }
+                          Button(onClick = { if (sel < g.moves.size - 1) sel++ }) { Text("▶") }
+                          Button(onClick = { sel = g.moves.size - 1 }) { Text("⏭") }
+                      }
+
+                      Card(Modifier.fillMaxWidth()) {
+                          Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              if (cur == null) {
+                                  Text("Start position. Press ▶ to step through the game.")
+                              } else {
+                                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      Text(
+                                          "${cur.moveNumber}${if (cur.whiteMoved) "." else "..."} ${cur.san}${cur.cls.symbol.let { if (it == "★") "" else it }}",
+                                          fontSize = 20.sp, fontWeight = FontWeight.Bold,
+                                      )
+                                      Text(cur.cls.label, color = Color(cur.cls.color), fontWeight = FontWeight.Bold)
+                                  }
+                                  Text(cur.explanation)
+                              }
+                          }
+                      }
+
+                      FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                          g.moves.forEachIndexed { i, m ->
+                              val label = (if (m.whiteMoved) "${m.moveNumber}. " else "") + m.san +
+                                  (if (m.cls.symbol == "★") "" else m.cls.symbol)
+                              Text(
+                                  label,
+                                  color = if (m.cls.ordinal >= Cls.INACCURACY.ordinal || m.cls.ordinal <= Cls.GREAT.ordinal) Color(m.cls.color) else Color.Unspecified,
+                                  modifier = Modifier
+                                      .clip(RoundedCornerShape(6.dp))
+                                      .background(if (i == sel) Color(0xFF3A3A3A) else Color.Transparent)
+                                      .clickable { sel = i }
+                                      .padding(horizontal = 6.dp, vertical = 4.dp),
+                              )
+                          }
+                      }
+
+                      Summary(g)
+                      OutlinedButton(onClick = { game = null; sel = -1 }) { Text("Analyze another game") }
+                  }
+              }
+          }
+
+          @Composable
+          fun EvalBar(cp: Int) {
+              val w = Analyzer.winProb(cp).toFloat().coerceIn(0.02f, 0.98f)
+              Row(Modifier.fillMaxWidth().height(14.dp)) {
+                  Box(Modifier.weight(w).fillMaxHeight().background(Color.White))
+                  Box(Modifier.weight(1f - w).fillMaxHeight().background(Color(0xFF222222)))
+              }
+          }
+
+          @Composable
+          fun Summary(g: GameAnalysis) {
+              Card(Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                      Text("Summary", fontWeight = FontWeight.Bold)
+                      Text("Accuracy — ${g.white}: ${"%.1f".format(g.accuracyWhite)}%   ${g.black}: ${"%.1f".format(g.accuracyBlack)}%")
+                      for (c in Cls.values()) {
+                          val w = g.countsWhite[c] ?: 0
+                          val b = g.countsBlack[c] ?: 0
+                          if (w + b > 0) {
+                              Row {
+                                  Text(c.label, Modifier.weight(1f), color = Color(c.color))
+                                  Text("$w", Modifier.width(40.dp))
+                                  Text("$b", Modifier.width(40.dp))
+                              }
+                          }
+                      }
+                      Text("(White | Black)", fontSize = 12.sp)
+                  }
+              }
+          }
+
+          private fun parseFen(fen: String): Array<CharArray> {
+              val rows = fen.substringBefore(' ').split('/')
+              return Array(8) { r ->
+                  val a = CharArray(8) { ' ' }
+                  var c = 0
+                  for (ch in rows[r]) if (ch.isDigit()) c += ch - '0' else a[c++] = ch
+                  a
+              }
+          }
+
+          @Composable
+          fun Board(fen: String, lastUci: String?) {
+              val grid = remember(fen) { parseFen(fen) }
+              Canvas(Modifier.fillMaxWidth().aspectRatio(1f)) {
+                  val sq = size.width / 8f
+                  val light = Color(0xFFEBECD0)
+                  val dark = Color(0xFF739552)
+                  val hl = Color(0x88F7EC59)
+                  val from = lastUci?.takeIf { it.length >= 4 }?.let { (it[0] - 'a') to (8 - (it[1] - '0')) }
+                  val to = lastUci?.takeIf { it.length >= 4 }?.let { (it[2] - 'a') to (8 - (it[3] - '0')) }
+                  val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = sq * 0.85f; textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT }
+                  val stroke = Paint(fill).apply { style = Paint.Style.STROKE; strokeWidth = sq * 0.04f; color = android.graphics.Color.BLACK }
+                  for (r in 0 until 8) for (c in 0 until 8) {
+                      drawRect(if ((r + c) % 2 == 0) light else dark, Offset(c * sq, r * sq), Size(sq, sq))
+                      if (from == (c to r) || to == (c to r)) drawRect(hl, Offset(c * sq, r * sq), Size(sq, sq))
+                      val ch = grid[r][c]
+                      if (ch != ' ') {
+                          val glyph = when (ch.lowercaseChar()) {
+                              'k' -> "♚"; 'q' -> "♛"; 'r' -> "♜"; 'b' -> "♝"; 'n' -> "♞"; else -> "♟"
+                          } + "︎"
+                          fill.color = if (ch.isUpperCase()) android.graphics.Color.WHITE else android.graphics.Color.rgb(20, 20, 20)
+                          val x = c * sq + sq / 2
+                          val y = r * sq + sq * 0.78f
+                          drawIntoCanvas {
+                              it.nativeCanvas.drawText(glyph, x, y, stroke)
+                              it.nativeCanvas.drawText(glyph, x, y, fill)
+                          }
+                      }
+                  }
+              }
+          }
+          GEN_EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      # Cache the compiled engine so it's only rebuilt when the tag changes
+      - name: Cache Stockfish binary
+        id: sf-cache
+        uses: actions/cache@v4
+        with:
+          path: stockfish-out
+          key: stockfish-${{ env.STOCKFISH_TAG }}-arm64-v8a
+
+      - name: Build Stockfish for Android (arm64-v8a, NNUE embedded)
+        if: steps.sf-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$STOCKFISH_TAG" https://github.com/official-stockfish/Stockfish.git
+          cd Stockfish/src
+          NDK_BIN="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export PATH="$NDK_BIN:$PATH"
+          export ANDROID_NDK_BIN="$NDK_BIN"
+          # Downloads the NNUE nets and embeds them in the binary -> fully offline at runtime
+          make -j"$(nproc)" build ARCH=armv8 COMP=ndk
+          "$NDK_BIN/llvm-strip" stockfish
+          mkdir -p "$GITHUB_WORKSPACE/stockfish-out"
+          cp stockfish "$GITHUB_WORKSPACE/stockfish-out/libstockfish.so"
+
+      # Android only lets apps exec files from nativeLibraryDir, so the engine ships
+      # as libstockfish.so and is launched via ProcessBuilder (UCI over stdin/stdout).
+      # In the app: android:extractNativeLibs="true" (or useLegacyPackaging = true).
+      - name: Install engine into jniLibs
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp stockfish-out/libstockfish.so app/src/main/jniLibs/arm64-v8a/libstockfish.so
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessAnalyzer-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      # Publishes the APK as a release so it can be downloaded straight from a phone
+      - name: Publish APK as release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk ChessAnalyzer.apk
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest ChessAnalyzer.apk --title "Chess Analyzer (latest build)" --notes "Download ChessAnalyzer.apk and install it."
