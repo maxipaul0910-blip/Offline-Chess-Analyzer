@@ -18,648 +18,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Creates the entire Android project from scratch, so the repo only needs this one file
-      - name: Generate Android project files
+      # The app source is stored compressed at the bottom of this file
+      - name: Extract project from this file
         run: |
-          mkdir -p "$(dirname settings.gradle.kts)"
-          cat > settings.gradle.kts <<'GEN_EOF'
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          dependencyResolutionManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
-          rootProject.name = "ChessAnalyzer"
-          include(":app")
-          GEN_EOF
-          mkdir -p "$(dirname build.gradle.kts)"
-          cat > build.gradle.kts <<'GEN_EOF'
-          plugins {
-              id("com.android.application") version "8.5.2" apply false
-              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
-              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
-          }
-          GEN_EOF
-          mkdir -p "$(dirname gradle.properties)"
-          cat > gradle.properties <<'GEN_EOF'
-          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
-          android.useAndroidX=true
-          android.nonTransitiveRClass=true
-          kotlin.code.style=official
-          GEN_EOF
-          mkdir -p "$(dirname app/build.gradle.kts)"
-          cat > app/build.gradle.kts <<'GEN_EOF'
-          plugins {
-              id("com.android.application")
-              id("org.jetbrains.kotlin.android")
-              id("org.jetbrains.kotlin.plugin.compose")
-          }
-
-          android {
-              namespace = "com.maxi.chessanalyzer"
-              compileSdk = 35
-
-              defaultConfig {
-                  applicationId = "com.maxi.chessanalyzer"
-                  minSdk = 26
-                  targetSdk = 35
-                  versionCode = 1
-                  versionName = "1.0"
-                  ndk { abiFilters += "arm64-v8a" }
-              }
-
-              buildFeatures { compose = true }
-
-              // Stockfish is shipped as libstockfish.so and must be extracted to disk to be executable
-              packaging { jniLibs { useLegacyPackaging = true } }
-
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }
-              kotlinOptions { jvmTarget = "17" }
-          }
-
-          dependencies {
-              implementation(platform("androidx.compose:compose-bom:2024.09.03"))
-              implementation("androidx.compose.ui:ui")
-              implementation("androidx.compose.foundation:foundation")
-              implementation("androidx.compose.material3:material3")
-              implementation("androidx.activity:activity-compose:1.9.2")
-              implementation("com.github.bhlangonijr:chesslib:1.3.4")
-          }
-          GEN_EOF
-          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
-          cat > app/src/main/AndroidManifest.xml <<'GEN_EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <!-- No INTERNET permission on purpose: everything runs offline -->
-              <application
-                  android:label="Chess Analyzer"
-                  android:extractNativeLibs="true"
-                  android:theme="@android:style/Theme.Material.NoActionBar">
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                  </activity>
-              </application>
-          </manifest>
-          GEN_EOF
-          mkdir -p "$(dirname app/src/main/java/com/maxi/chessanalyzer/Engine.kt)"
-          cat > app/src/main/java/com/maxi/chessanalyzer/Engine.kt <<'GEN_EOF'
-          package com.maxi.chessanalyzer
-
-          import android.content.Context
-          import java.io.BufferedReader
-          import java.io.BufferedWriter
-          import java.io.Closeable
-          import java.io.File
-
-          /** One engine line. cp is from the side-to-move's view; mate > 0 means side to move mates in N. */
-          data class EngineLine(val cp: Int, val mate: Int?, val pv: List<String>)
-
-          /** Talks UCI to the bundled Stockfish binary (libstockfish.so in the native lib dir). */
-          class Engine(context: Context) : Closeable {
-              private val proc: Process
-              private val out: BufferedWriter
-              private val inp: BufferedReader
-
-              init {
-                  val exe = File(context.applicationInfo.nativeLibraryDir, "libstockfish.so")
-                  proc = ProcessBuilder(exe.absolutePath).redirectErrorStream(true).start()
-                  out = proc.outputStream.bufferedWriter()
-                  inp = proc.inputStream.bufferedReader()
-                  send("uci"); waitFor("uciok")
-                  send("setoption name MultiPV value 2")
-                  send("setoption name Threads value ${Runtime.getRuntime().availableProcessors().coerceIn(1, 4)}")
-                  send("setoption name Hash value 64")
-                  send("isready"); waitFor("readyok")
-              }
-
-              private fun send(s: String) { out.write(s); out.newLine(); out.flush() }
-
-              private fun waitFor(token: String) {
-                  while (true) {
-                      val l = inp.readLine() ?: error("Engine stopped")
-                      if (l.trim() == token) return
-                  }
-              }
-
-              fun analyze(fen: String, depth: Int): List<EngineLine> {
-                  send("position fen $fen")
-                  send("go depth $depth")
-                  val lines = HashMap<Int, EngineLine>()
-                  while (true) {
-                      val l = inp.readLine() ?: error("Engine stopped")
-                      if (l.startsWith("bestmove")) break
-                      if (!l.startsWith("info") || " pv " !in l || " score " !in l) continue
-                      if ("lowerbound" in l || "upperbound" in l) continue
-                      val t = l.split(' ')
-                      val mpvIdx = t.indexOf("multipv")
-                      val mpv = if (mpvIdx >= 0) t[mpvIdx + 1].toInt() else 1
-                      val si = t.indexOf("score")
-                      val kind = t[si + 1]
-                      val v = t[si + 2].toInt()
-                      val pv = t.drop(t.indexOf("pv") + 1)
-                      lines[mpv] = if (kind == "mate")
-                          EngineLine(if (v > 0) 10000 - v else -10000 - v, v, pv)
-                      else
-                          EngineLine(v.coerceIn(-9000, 9000), null, pv)
-                  }
-                  return lines.toSortedMap().values.toList()
-              }
-
-              override fun close() {
-                  try { send("quit") } catch (_: Exception) {}
-                  proc.destroy()
-              }
-          }
-          GEN_EOF
-          mkdir -p "$(dirname app/src/main/java/com/maxi/chessanalyzer/Analyzer.kt)"
-          cat > app/src/main/java/com/maxi/chessanalyzer/Analyzer.kt <<'GEN_EOF'
-          package com.maxi.chessanalyzer
-
-          import com.github.bhlangonijr.chesslib.Board
-          import com.github.bhlangonijr.chesslib.Piece
-          import com.github.bhlangonijr.chesslib.PieceType
-          import com.github.bhlangonijr.chesslib.Side
-          import com.github.bhlangonijr.chesslib.move.Move
-          import com.github.bhlangonijr.chesslib.move.MoveList
-          import kotlin.math.abs
-          import kotlin.math.exp
-
-          enum class Cls(val symbol: String, val label: String, val color: Long) {
-              BRILLIANT("!!", "Brilliant", 0xFF26C2A3),
-              GREAT("!", "Great", 0xFF5C8BB0),
-              BEST("★", "Best", 0xFF81B64C),
-              EXCELLENT("", "Excellent", 0xFF81B64C),
-              GOOD("", "Good", 0xFF95B776),
-              INACCURACY("?!", "Inaccuracy", 0xFFF7C631),
-              MISTAKE("?", "Mistake", 0xFFE58F2A),
-              BLUNDER("??", "Blunder", 0xFFCA3431),
-          }
-
-          data class MoveInfo(
-              val san: String,
-              val uci: String,
-              val whiteMoved: Boolean,
-              val moveNumber: Int,
-              val fenAfter: String,
-              val cls: Cls,
-              val explanation: String,
-              val evalWhiteCp: Int,
-              val evalText: String,
-          )
-
-          data class GameAnalysis(
-              val white: String,
-              val black: String,
-              val startFen: String,
-              val startEvalCp: Int,
-              val moves: List<MoveInfo>,
-              val accuracyWhite: Double,
-              val accuracyBlack: Double,
-              val countsWhite: Map<Cls, Int>,
-              val countsBlack: Map<Cls, Int>,
-          )
-
-          object Analyzer {
-              private const val START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-
-              fun winProb(cp: Int): Double = 1.0 / (1.0 + exp(-0.00368208 * cp))
-
-              private fun value(p: Piece): Int = when (p.pieceType) {
-                  PieceType.PAWN -> 1
-                  PieceType.KNIGHT, PieceType.BISHOP -> 3
-                  PieceType.ROOK -> 5
-                  PieceType.QUEEN -> 9
-                  else -> 0
-              }
-
-              private fun name(p: Piece): String = p.pieceType?.name?.lowercase() ?: "piece"
-
-              private fun uciToSan(fen: String, uci: String): String = try {
-                  val b = Board(); b.loadFromFen(fen)
-                  val ml = MoveList(fen)
-                  ml.add(Move(uci, b.sideToMove))
-                  ml.toSanArray()[0]
-              } catch (e: Exception) { uci }
-
-              private fun evalPos(engine: Engine, fen: String, depth: Int): List<EngineLine> {
-                  val b = Board(); b.loadFromFen(fen)
-                  if (b.isMated) return listOf(EngineLine(-10000, 0, emptyList()))
-                  if (b.isStaleMate || b.isDraw) return listOf(EngineLine(0, null, emptyList()))
-                  return engine.analyze(fen, depth)
-              }
-
-              private fun fmt(cpWhite: Int, mateWhite: Int?): String = when {
-                  mateWhite != null && mateWhite == 0 -> "#"
-                  mateWhite != null -> (if (mateWhite < 0) "-" else "") + "M" + abs(mateWhite)
-                  else -> String.format("%+.1f", cpWhite / 100.0)
-              }
-
-              private class Parsed(val white: String, val black: String, val fen: String?, val sans: List<String>)
-
-              private fun parse(pgn: String): Parsed {
-                  fun hdr(k: String) = Regex("""\[$k\s+"([^"]*)"\]""").find(pgn)?.groupValues?.get(1)
-                  var t = pgn.replace(Regex("""(?m)^\s*\[.*\]\s*$"""), " ")
-                  t = t.replace(Regex("""\{[^}]*\}"""), " ").replace(Regex(""";[^\n]*"""), " ")
-                  var prev: String
-                  do { prev = t; t = t.replace(Regex("""\([^()]*\)"""), " ") } while (t != prev)
-                  t = t.replace(Regex("""\$\d+"""), " ").replace(Regex("""\d+\.+"""), " ")
-                  val results = setOf("1-0", "0-1", "1/2-1/2", "*")
-                  val sans = t.split(Regex("\\s+"))
-                      .map { it.trim().replace(Regex("[!?]+$"), "") }
-                      .filter { it.isNotEmpty() && it !in results }
-                      .map { it.replace("0-0-0", "O-O-O").replace("0-0", "O-O") }
-                  return Parsed(hdr("White") ?: "White", hdr("Black") ?: "Black", hdr("FEN"), sans)
-              }
-
-              fun analyze(engine: Engine, pgn: String, depth: Int, onProgress: (Int, Int) -> Unit): GameAnalysis {
-                  val p = parse(pgn)
-                  if (p.sans.isEmpty()) throw IllegalArgumentException("No moves found in that PGN.")
-
-                  // Replay the game
-                  val board = Board()
-                  if (p.fen != null) board.loadFromFen(p.fen)
-                  val startFen = board.fen
-                  val fens = mutableListOf(startFen)
-                  val moves = mutableListOf<Move>()
-                  for (s in p.sans) {
-                      val ok = try { board.doMove(s) } catch (e: Exception) { false }
-                      if (!ok) throw IllegalArgumentException("Couldn't read the move \"$s\" (move ${moves.size / 2 + 1}).")
-                      val m = board.undoMove()
-                      board.doMove(m)
-                      moves.add(m)
-                      fens.add(board.fen)
-                  }
-
-                  // Evaluate every position once
-                  val ev = fens.mapIndexed { i, fen ->
-                      onProgress(i + 1, fens.size)
-                      evalPos(engine, fen, depth)
-                  }
-
-                  val infos = mutableListOf<MoveInfo>()
-                  val accSum = doubleArrayOf(0.0, 0.0)
-                  val accCnt = intArrayOf(0, 0)
-                  val counts = arrayOf(HashMap<Cls, Int>(), HashMap<Cls, Int>())
-                  var lastCaptureSquare: String? = null
-
-                  for (i in moves.indices) {
-                      val lines = ev[i]
-                      val best = lines[0]
-                      val after = ev[i + 1][0]
-                      val move = moves[i]
-                      val uci = move.toString().lowercase()
-                      val san = p.sans[i]
-
-                      val before = Board(); before.loadFromFen(fens[i])
-                      val whiteMoved = before.sideToMove == Side.WHITE
-                      val side = if (whiteMoved) 0 else 1
-
-                      val matched = lines.firstOrNull { it.pv.firstOrNull()?.lowercase() == uci }
-                      val isBest = best.pv.firstOrNull()?.lowercase() == uci
-                      val playedCp = matched?.cp ?: -after.cp
-                      val playedMate: Int? = if (matched != null) matched.mate else after.mate?.let { -it }
-
-                      val wpBest = winProb(best.cp)
-                      val wpPlayed = winProb(playedCp)
-                      val loss = (wpBest - wpPlayed).coerceAtLeast(0.0)
-
-                      // Material-sacrifice detection (for "Brilliant")
-                      val moved = before.getPiece(move.from)
-                      val captured = before.getPiece(move.to)
-                      val afterBoard = Board(); afterBoard.loadFromFen(fens[i + 1])
-                      val opp = if (whiteMoved) Side.BLACK else Side.WHITE
-                      val attacked = afterBoard.squareAttackedBy(move.to, opp) != 0L
-                      val sacrificed = attacked && value(moved) >= 3 &&
-                          value(moved) - (if (captured == Piece.NONE) 0 else value(captured)) >= 3
-                      val toSq = move.to.toString().lowercase()
-                      val isRecapture = lastCaptureSquare == toSq
-
-                      val gap = if (lines.size > 1) wpBest - winProb(lines[1].cp) else 0.0
-                      val cls = when {
-                          loss >= 0.20 -> Cls.BLUNDER
-                          loss >= 0.10 -> Cls.MISTAKE
-                          loss >= 0.05 -> Cls.INACCURACY
-                          loss < 0.02 && sacrificed && matched != null && wpBest < 0.80 && wpPlayed > 0.45 && !isRecapture -> Cls.BRILLIANT
-                          isBest && gap >= 0.15 && wpBest < 0.95 && !isRecapture -> Cls.GREAT
-                          isBest -> Cls.BEST
-                          loss < 0.02 -> Cls.EXCELLENT
-                          else -> Cls.GOOD
-                      }
-
-                      val bestSan = best.pv.firstOrNull()?.let { uciToSan(fens[i], it) } ?: ""
-                      val evalBeforeW = if (whiteMoved) best.cp else -best.cp
-                      val evalAfterW = if (whiteMoved) playedCp else -playedCp
-                      val mateAfterW = playedMate?.let { if (whiteMoved) it else -it }
-                      val mateBeforeW = best.mate?.let { if (whiteMoved) it else -it }
-                      val swing = "Eval: ${fmt(evalBeforeW, mateBeforeW)} → ${fmt(evalAfterW, mateAfterW)}"
-
-                      val explanation = when (cls) {
-                          Cls.BRILLIANT -> "Brilliant! You gave up your ${name(moved)} on $toSq, but the engine confirms the idea works out."
-                          Cls.GREAT -> "Great move! It was the key move here — the alternatives were much worse."
-                          Cls.BEST -> "Best move — the engine's top choice."
-                          Cls.EXCELLENT -> "Excellent — nearly as strong as the best move ($bestSan)."
-                          Cls.GOOD -> "Good move. The engine slightly preferred $bestSan."
-                          else -> {
-                              val head = "$san is ${if (cls == Cls.BLUNDER) "a blunder" else if (cls == Cls.MISTAKE) "a mistake" else "an inaccuracy"}."
-                              val reason = when {
-                                  best.mate != null && best.mate > 0 && !(playedMate != null && playedMate > 0) ->
-                                      "You missed a forced checkmate in ${best.mate}."
-                                  playedMate != null && playedMate < 0 ->
-                                      "This allows checkmate in ${-playedMate}."
-                                  else -> {
-                                      val reply = after.pv.firstOrNull()
-                                      val replyCap = reply?.let {
-                                          try { afterBoard.getPiece(Move(it, afterBoard.sideToMove).to) } catch (e: Exception) { Piece.NONE }
-                                      } ?: Piece.NONE
-                                      val bestCap = best.pv.firstOrNull()?.let {
-                                          try { before.getPiece(Move(it, before.sideToMove).to) } catch (e: Exception) { Piece.NONE }
-                                      } ?: Piece.NONE
-                                      when {
-                                          replyCap != Piece.NONE ->
-                                              "Now the opponent can play ${uciToSan(fens[i + 1], reply!!)} and win your ${name(replyCap)}."
-                                          bestCap != Piece.NONE ->
-                                              "You missed the chance to win the ${name(bestCap)} on ${best.pv[0].substring(2, 4)}."
-                                          else -> "The position got worse than it needed to."
-                                      }
-                                  }
-                              }
-                              "$head Better was $bestSan. $reason"
-                          }
-                      } + "\n" + swing
-
-                      lastCaptureSquare = if (captured != Piece.NONE) toSq else null
-
-                      val acc = (103.1668 * exp(-0.04354 * loss * 100) - 3.1669).coerceIn(0.0, 100.0)
-                      accSum[side] += acc; accCnt[side]++
-                      counts[side][cls] = (counts[side][cls] ?: 0) + 1
-
-                      infos.add(
-                          MoveInfo(
-                              san = san, uci = uci, whiteMoved = whiteMoved,
-                              moveNumber = before.moveCounter,
-                              fenAfter = fens[i + 1], cls = cls, explanation = explanation,
-                              evalWhiteCp = evalAfterW, evalText = fmt(evalAfterW, mateAfterW),
-                          )
-                      )
-                  }
-
-                  val startBoard = Board(); startBoard.loadFromFen(startFen)
-                  val startW = if (startBoard.sideToMove == Side.WHITE) ev[0][0].cp else -ev[0][0].cp
-                  return GameAnalysis(
-                      white = p.white, black = p.black, startFen = startFen, startEvalCp = startW,
-                      moves = infos,
-                      accuracyWhite = if (accCnt[0] > 0) accSum[0] / accCnt[0] else 0.0,
-                      accuracyBlack = if (accCnt[1] > 0) accSum[1] / accCnt[1] else 0.0,
-                      countsWhite = counts[0], countsBlack = counts[1],
-                  )
-              }
-          }
-          GEN_EOF
-          mkdir -p "$(dirname app/src/main/java/com/maxi/chessanalyzer/MainActivity.kt)"
-          cat > app/src/main/java/com/maxi/chessanalyzer/MainActivity.kt <<'GEN_EOF'
-          package com.maxi.chessanalyzer
-
-          import android.graphics.Paint
-          import android.graphics.Typeface
-          import android.os.Bundle
-          import androidx.activity.ComponentActivity
-          import androidx.activity.compose.rememberLauncherForActivityResult
-          import androidx.activity.compose.setContent
-          import androidx.activity.result.contract.ActivityResultContracts
-          import androidx.compose.foundation.Canvas
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.clickable
-          import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.rememberScrollState
-          import androidx.compose.foundation.shape.RoundedCornerShape
-          import androidx.compose.foundation.verticalScroll
-          import androidx.compose.material3.*
-          import androidx.compose.runtime.*
-          import androidx.compose.ui.Alignment
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.draw.clip
-          import androidx.compose.ui.geometry.Offset
-          import androidx.compose.ui.geometry.Size
-          import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-          import androidx.compose.ui.graphics.nativeCanvas
-          import androidx.compose.ui.platform.LocalContext
-          import androidx.compose.ui.text.font.FontWeight
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
-          import kotlinx.coroutines.Dispatchers
-          import kotlinx.coroutines.launch
-          import kotlinx.coroutines.withContext
-
-          class MainActivity : ComponentActivity() {
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  setContent {
-                      MaterialTheme(colorScheme = darkColorScheme()) {
-                          Surface(Modifier.fillMaxSize()) { App() }
-                      }
-                  }
-              }
-          }
-
-          @OptIn(ExperimentalLayoutApi::class)
-          @Composable
-          fun App() {
-              val ctx = LocalContext.current
-              val scope = rememberCoroutineScope()
-              var pgn by remember { mutableStateOf("") }
-              var status by remember { mutableStateOf<String?>(null) }
-              var busy by remember { mutableStateOf(false) }
-              var game by remember { mutableStateOf<GameAnalysis?>(null) }
-              var sel by remember { mutableStateOf(-1) }
-
-              val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-                  if (uri != null) {
-                      try {
-                          pgn = ctx.contentResolver.openInputStream(uri)!!.bufferedReader().use { it.readText() }
-                      } catch (e: Exception) { status = "Couldn't open file: ${e.message}" }
-                  }
-              }
-
-              fun run() {
-                  busy = true; game = null; sel = -1; status = "Starting engine…"
-                  scope.launch {
-                      try {
-                          val r = withContext(Dispatchers.Default) {
-                              Engine(ctx).use { e ->
-                                  Analyzer.analyze(e, pgn, 14) { d, t -> status = "Analyzing position $d of $t…" }
-                              }
-                          }
-                          game = r; status = null
-                      } catch (e: Exception) {
-                          status = "Error: ${e.message}"
-                      } finally { busy = false }
-                  }
-              }
-
-              Column(
-                  Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()
-                      .verticalScroll(rememberScrollState()).padding(16.dp),
-                  verticalArrangement = Arrangement.spacedBy(12.dp),
-              ) {
-                  val g = game
-                  if (g == null) {
-                      Text("Chess Analyzer", fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                      Text("Paste a PGN or open a .pgn file. Everything runs offline on your phone with Stockfish.")
-                      OutlinedTextField(
-                          value = pgn, onValueChange = { pgn = it },
-                          modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp),
-                          label = { Text("PGN") },
-                      )
-                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                          Button(onClick = { run() }, enabled = !busy && pgn.isNotBlank()) { Text("Analyze") }
-                          OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !busy) { Text("Open file") }
-                      }
-                      status?.let { Text(it) }
-                      if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                  } else {
-                      val cur = if (sel >= 0) g.moves[sel] else null
-                      val fen = cur?.fenAfter ?: g.startFen
-                      val evalCp = cur?.evalWhiteCp ?: g.startEvalCp
-
-                      Text("${g.white} vs ${g.black}", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                      Board(fen, cur?.uci)
-                      EvalBar(evalCp)
-
-                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                          Button(onClick = { sel = -1 }) { Text("⏮") }
-                          Button(onClick = { if (sel >= 0) sel-- }) { Text("◀") }
-                          Button(onClick = { if (sel < g.moves.size - 1) sel++ }) { Text("▶") }
-                          Button(onClick = { sel = g.moves.size - 1 }) { Text("⏭") }
-                      }
-
-                      Card(Modifier.fillMaxWidth()) {
-                          Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                              if (cur == null) {
-                                  Text("Start position. Press ▶ to step through the game.")
-                              } else {
-                                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                      Text(
-                                          "${cur.moveNumber}${if (cur.whiteMoved) "." else "..."} ${cur.san}${cur.cls.symbol.let { if (it == "★") "" else it }}",
-                                          fontSize = 20.sp, fontWeight = FontWeight.Bold,
-                                      )
-                                      Text(cur.cls.label, color = Color(cur.cls.color), fontWeight = FontWeight.Bold)
-                                  }
-                                  Text(cur.explanation)
-                              }
-                          }
-                      }
-
-                      FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                          g.moves.forEachIndexed { i, m ->
-                              val label = (if (m.whiteMoved) "${m.moveNumber}. " else "") + m.san +
-                                  (if (m.cls.symbol == "★") "" else m.cls.symbol)
-                              Text(
-                                  label,
-                                  color = if (m.cls.ordinal >= Cls.INACCURACY.ordinal || m.cls.ordinal <= Cls.GREAT.ordinal) Color(m.cls.color) else Color.Unspecified,
-                                  modifier = Modifier
-                                      .clip(RoundedCornerShape(6.dp))
-                                      .background(if (i == sel) Color(0xFF3A3A3A) else Color.Transparent)
-                                      .clickable { sel = i }
-                                      .padding(horizontal = 6.dp, vertical = 4.dp),
-                              )
-                          }
-                      }
-
-                      Summary(g)
-                      OutlinedButton(onClick = { game = null; sel = -1 }) { Text("Analyze another game") }
-                  }
-              }
-          }
-
-          @Composable
-          fun EvalBar(cp: Int) {
-              val w = Analyzer.winProb(cp).toFloat().coerceIn(0.02f, 0.98f)
-              Row(Modifier.fillMaxWidth().height(14.dp)) {
-                  Box(Modifier.weight(w).fillMaxHeight().background(Color.White))
-                  Box(Modifier.weight(1f - w).fillMaxHeight().background(Color(0xFF222222)))
-              }
-          }
-
-          @Composable
-          fun Summary(g: GameAnalysis) {
-              Card(Modifier.fillMaxWidth()) {
-                  Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                      Text("Summary", fontWeight = FontWeight.Bold)
-                      Text("Accuracy — ${g.white}: ${"%.1f".format(g.accuracyWhite)}%   ${g.black}: ${"%.1f".format(g.accuracyBlack)}%")
-                      for (c in Cls.values()) {
-                          val w = g.countsWhite[c] ?: 0
-                          val b = g.countsBlack[c] ?: 0
-                          if (w + b > 0) {
-                              Row {
-                                  Text(c.label, Modifier.weight(1f), color = Color(c.color))
-                                  Text("$w", Modifier.width(40.dp))
-                                  Text("$b", Modifier.width(40.dp))
-                              }
-                          }
-                      }
-                      Text("(White | Black)", fontSize = 12.sp)
-                  }
-              }
-          }
-
-          private fun parseFen(fen: String): Array<CharArray> {
-              val rows = fen.substringBefore(' ').split('/')
-              return Array(8) { r ->
-                  val a = CharArray(8) { ' ' }
-                  var c = 0
-                  for (ch in rows[r]) if (ch.isDigit()) c += ch - '0' else a[c++] = ch
-                  a
-              }
-          }
-
-          @Composable
-          fun Board(fen: String, lastUci: String?) {
-              val grid = remember(fen) { parseFen(fen) }
-              Canvas(Modifier.fillMaxWidth().aspectRatio(1f)) {
-                  val sq = size.width / 8f
-                  val light = Color(0xFFEBECD0)
-                  val dark = Color(0xFF739552)
-                  val hl = Color(0x88F7EC59)
-                  val from = lastUci?.takeIf { it.length >= 4 }?.let { (it[0] - 'a') to (8 - (it[1] - '0')) }
-                  val to = lastUci?.takeIf { it.length >= 4 }?.let { (it[2] - 'a') to (8 - (it[3] - '0')) }
-                  val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = sq * 0.85f; textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT }
-                  val stroke = Paint(fill).apply { style = Paint.Style.STROKE; strokeWidth = sq * 0.04f; color = android.graphics.Color.BLACK }
-                  for (r in 0 until 8) for (c in 0 until 8) {
-                      drawRect(if ((r + c) % 2 == 0) light else dark, Offset(c * sq, r * sq), Size(sq, sq))
-                      if (from == (c to r) || to == (c to r)) drawRect(hl, Offset(c * sq, r * sq), Size(sq, sq))
-                      val ch = grid[r][c]
-                      if (ch != ' ') {
-                          val glyph = when (ch.lowercaseChar()) {
-                              'k' -> "♚"; 'q' -> "♛"; 'r' -> "♜"; 'b' -> "♝"; 'n' -> "♞"; else -> "♟"
-                          } + "︎"
-                          fill.color = if (ch.isUpperCase()) android.graphics.Color.WHITE else android.graphics.Color.rgb(20, 20, 20)
-                          val x = c * sq + sq / 2
-                          val y = r * sq + sq * 0.78f
-                          drawIntoCanvas {
-                              it.nativeCanvas.drawText(glyph, x, y, stroke)
-                              it.nativeCanvas.drawText(glyph, x, y, fill)
-                          }
-                      }
-                  }
-              }
-          }
-          GEN_EOF
+          F=.github/workflows/android.yml
+          if ! grep -q '^#PAYLOAD_END' "$F"; then echo "ERROR: android.yml is incomplete (cut off while copying). Re-upload the full file."; exit 1; fi
+          sed -n '/^#PAYLOAD_BEGIN/,/^#PAYLOAD_END/p' "$F" | grep '^# ' | cut -c3- | base64 -d | tar xz
+          ls -R app | head -30
 
       - uses: actions/setup-java@v4
         with:
@@ -685,16 +50,13 @@ jobs:
           cd Stockfish/src
           NDK_BIN="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export PATH="$NDK_BIN:$PATH"
-          export ANDROID_NDK_BIN="$NDK_BIN"
           # Downloads the NNUE nets and embeds them in the binary -> fully offline at runtime
           make -j"$(nproc)" build ARCH=armv8 COMP=ndk
           "$NDK_BIN/llvm-strip" stockfish
           mkdir -p "$GITHUB_WORKSPACE/stockfish-out"
           cp stockfish "$GITHUB_WORKSPACE/stockfish-out/libstockfish.so"
 
-      # Android only lets apps exec files from nativeLibraryDir, so the engine ships
-      # as libstockfish.so and is launched via ProcessBuilder (UCI over stdin/stdout).
-      # In the app: android:extractNativeLibs="true" (or useLegacyPackaging = true).
+      # Android only runs executables from the native lib dir, so the engine ships as libstockfish.so
       - name: Install engine into jniLibs
         run: |
           mkdir -p app/src/main/jniLibs/arm64-v8a
@@ -719,3 +81,123 @@ jobs:
           cp app/build/outputs/apk/debug/app-debug.apk ChessAnalyzer.apk
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest ChessAnalyzer.apk --title "Chess Analyzer (latest build)" --notes "Download ChessAnalyzer.apk and install it."
+
+#PAYLOAD_BEGIN
+# H4sIAAAAAAAAA+w823LbuJJ59lfAXO8ZMpGoiy9JnNheW5Ez3jiyx3Ymc8rOTFEUJDGmSIYgfTk5rtqX3Q/Y2of9vvmS7W4AvIj0
+# JVOZnNrdIIlEAo1GA+g7oAieJF4wEfYkdkY+t88T8ehrlzaUtZUV+oYy/91eebryqLPaXVt7utZpd5Yfwb+VTvsRa391SmpKKhIn
+# ZuxRHIbJXXD3tf8vLZGfTrzgrRM4Ez7jQcI+LzAoMY9C4SVh7HGhqrBMwnDic9PKKmbOBQ960C92/EK1ZKZDwn0YxknWeLNwszDi
+# EQ9GPHCvj7gI/TTxwq9OAFWzzyyNfbYBn55pTJMkEuut1kcviRz33PZCwwJ6NFW4v4dx+JG7iR04Mw7djN6UC7EdOP7133hsLHiB
+# 66cjbhrrThQZ1sI/eu++Rhmmnj/6M4X/0f3yv7zcUfK/urLafQry311bXf4u/9+iSPnXIuaNTMMNZ7YTjOLQG9nA577nOiihICwX
+# PBbwxIxn9qrdNRi2XrOx4wue9Q7jif2RJ8PYAaz2eZj4XqDRFVF07bbdbX8BDkmoDdSBYuD3obr5PyGc36AoyY/iMOJxAsr2Txjj
+# Pvnvrq7N2//OSve7/H+LgrKmeODjxcyJJ2Kj+cvsannCmq/GHtSCnQ5H4CFuvDvZbT5b0JohFXxbPv6ykcQpzxqCMDiJnQBst3fB
+# j3q+I4QEUHIM2Lgtkmufb4Tjsed6jp/1FWkUxWBy3wX4BH4DH/VA3oGM49H5xvLqd6H+6gWUZuvP9gHukf9ut12R/5Xud/n/JuUL
+# 7P8DbfyXmXGw1Fr8FQ3ofAvw0MkDR2JmzpVnu+iKO5krjoBuphoAEpQDVY742En9pBcGY29SCBwKM9kb3YeZIggvkJi7a1kdcMqE
+# J9mAulp5Ij3QbNDQma8fqGiiY7dz9AEg+cycobfr+QnAsScA4cSztZXmxTPHyAIT+iIB3eVOksYYDTG1eoAUNauGarXYcRK652NP
+# TJknmJh6UcRHzBHM94ZCN9kiZLDibAacz4ac8SuInVxQtSwJ2cgT5/hN9dxNE2foS8cMYyYHtg4WlX0MvH3AiPGV4Pt84rjXh1mz
+# JkqTpbbpIMK1L8ZyIkxjl6OCh20Zer6XXEPnf3UunJ/lwtk/94+O9w4Gv3Wezm3BF3SSCym5L6OBga07IUy0MU8NCgHzyDQPOr1Z
+# 5FNcSqxjRr6TjMN4ZhqKaa80K6+r7+YwnK13290Vu/3cbi8bllWHp9LdTr311DMeCDwO02BEjev540M7zxxgODC7y+vZ031dgT+8
+# C1jqdf3Q1LPu2M8hFKjvjiI28ZJpOrSHU98JJmHgfYzXSeCAI6Hvsr1GKuAfrQX//xa0/yJ2WzNQ0i3l0b11Am/MRWJfzfyvMcY9
+# 9h+i/ad5/L+M9n91bW3tu/3/FuXlFmyytlQbZKNY5vIbaTJuPjO2NhdezhRPMAAPxLrSDBuUVVtvtQQI9cwRmeMAot9yovMW2KuW
+# 9gw2SUm8XGw22SBke4OT/tGgf8Ig7px5gkJ5+BulMekVxoGm62SKFiVOQWdDsAAanLNmU+EpWPTcysuh1n1nyP0Nmb9j2xXbrsGU
+# 6Rs4GKugRdsw0HZVAROYHd8w/kW/U/zSOsFa+61SovYg3HaRmh0nVnOVdCqVmdUUEaOzs2EADi/YVnBGLSC/kvGQonCzBPTSCxJQ
+# u80x+RLltowGWNzyqHqvZGdbwthvt/cGBmvVIIG15pMwvr4bjYay97ffDXo/9o8qyF62biH3ZUuvldriVmGPgQdbmgk3vxuMr1VK
+# +v8juFEtFF10jFslx7jVD8C7w/Dwy8e4R/+vPM3yP6D/V6C+2wEL8F3/f4si3XrO6sOhhQXw6UDvsFyvSynv4fdVopuRcWwvtHfS
+# 8ZjHfHTEnRH0vqX1fewl1daeD3qfwo25BoiQ+MJC6/FjdgD6nxMfMrQFNnMjDHTGcThjoKKZ8Ea8mYTNWXjBfxDswuOXLxg6uWyT
+# tdmMO2BHEAYjHIShNsG8gA1s9ri1AH60w1xMWTHJ7vvwz7xwfBhone0FSYPhC/ai1y35Hl2ss31PJC+Pkxjs1aYlqT1x/HPB3vX2
+# cDgkbwieug9xVh6lDb3AAYVqzsdnQBF2CMgwYfQGgVlsEY1F8kxXbsM6U/thMXjU66gimCj2LnAJiNI4dNfZIXzCJldawxQwzW3S
+# PIwXRDmM2mbp/AdeUgjuEBYiSAivcPs0ocWEwl4wDu1Am94Y1uGVFzeYMbcWRn6oh9QDQkX+DgbFPDZhFNsZ0kEiP3SSqWUDZV7M
+# 3aQfx2EMe8KdmYlW07JR1pPCMSHMGBAiXhseozSR0PawtAiFDjB93QEeK/ByQQrwAuJJ00hdiOxesEvHS3bDmN7Dc2MeSvAkpACV
+# UiDsbeon3uHPuJIQTnfvAz+ZAiUjocCXPh+lQeKBewIxrno0LRskyvORN9QahrGAWjfkEIjvBWanwVasm/tG+tEBzpXDrK1UgD2B
+# dFyX5ks12YxVXkBz1TgNZFexzqQAWRCgw3bYl7j6pgBM+BbwSxJH9Tr2UzE1rTpsetwkPOdBAWlG6eUUeJJJnihUa77FI2PYXRvJ
+# lkOyLXBIkZtMQ0oeAxbF5Eph+sQeY5BlG8abQZ+NDUYUWCzmSRrnXmopt4MEK3VrjnNyG2zEo2RKasZS6iXXSZvFNAotO52W4xYB
+# DrYEH5WNmYQSJVuir0I7zRmwCpg3bu5bJ3pJyq4wYIGn/+TVIxkV771kahpDcPZQURuWxYaA8LwCv1ju4IFSMSz2978zA9QyfCyC
+# KvXlu3DDmOsqi6FK8oKUV1AafnjJ4yHmVQyWdU+B4GLlLQhwBVCnAFmg6RLzB/aDVQGYRRd7oyvMlIEWGfGrg7FpzFDcowujFhqX
+# FChT/TY3WNtiyal6fcI6H+wkhB2Dpea+4IUUpMYhvPJotBY1Y50DBEKeQgfEWwG4yFu72agVKKI4scFniMzCqDg9RFvuQKyHk/mg
+# pimJ2GAGGto5IrEUbDOCX6B1t1gHfUnWBAppDZrZewP/RhdlPFwfON+C+CLXis3ngKjB8NNqsCD1/TK6m+xJyrmcEKzNMUVsIE2g
+# Y0lfYiVKsllShMDfcYxeCaoCF623WZSrBByEz0qGP6VegrdWGJhQd8rM39ZZ/8rlpJyhT04JWagRSE8cXheu3lT9vwf7/zqK/gMR
+# wN3+f3e1u1K4//GU/P/V5c53//9blAf6//WpXFuncu2d0IlHDwU+9LjLvwj45Dp6cIdjEKWHwqJtsd/Cxxd3QDHWndTRFmirKXqi
+# ddX8KlpY4EE6U+FFzxcUV4jr2TD0c6NPBhSTV+UqN/TDGLyAMPdjdo729vf3tgcnprG4aIDfvBN7vu85QQIv7avd3e5ar7u9bDUI
+# +vVRfxshEfA1GFINtNp7trPTVkA7/WOA+f2//53QgfJQQM86O2srPQXU/6XX39/v47gIhurH93lQC/v64OCVBHsdhiMF8Xx15+nT
+# NQWxN9ju9d4dbff+ahpbRN1e4LhuGjvutYLffdpbW+4o+Ld7xyfbb/oAjLBvYROcc64A+6vPdrvbei777wav+kcASJA7PhhuHivI
+# 3vbyCqHEM5885sN9xajEXMjMppM7ZFkleO/VSnCKEo4IRhAehaEPsWbeiFwzSGdDHssoMmsAP217nGD1PD7XFxjKibwGWAgYUh76
+# VMA5fLxHEnrR3BDYckIxou5jlSb9Glx60u3CE2Z5OtVhhj6oi2o1eWC7vIYuaunDU4UuXBOhHFu98Jt5s2aC95KQV2EKUUu1eUcS
+# NN/sgp8GLqHsi+4sriSOvzkPoxDMwcAShUO8Cpolj+eCafD9REJogB+PTn7b7Q/wJDEOhp/Oh0HcilRpPVN/DlVpHQ12fnqzMzhi
+# l+zNT+efwEFps46RxwKXXgDB2dBUGQdLTw5Plu02azETv54gO5jNtt1uL68967afscfMjSyrGgyR42ECMlKkFiEFXJdTiBPMyI60
+# ei26HJnOtQ+33w9Yc7PgUeZtbwZ7r388aRRqdvaOfzw4RPjlGvijg4M32LZa0/bTu36fBnqeNUovDly724JGDEaLE5O8h+F5Pqst
+# usu7ZZNL7zpCRSMGARhVnCDbJ+GxE5RDsYLEF8chz6wURQ2hlkwhRqlDGNUZ7cbhDEQDEZYjrhkGStqUlJtnvu2MRiY2mjB2A1Bh
+# 2uokxBqrBJcgtdtx7ICbd9qW/nrmHvKye4jzqFtIVBGHoTBlam1ducEN9ofC0S9ZBvTeh7Yn8AhlZOXus0ggWig449KXB93dYHwW
+# JdfSh7aqiI4Tx+eIDUM2rHgVO5d3IG5rf74ereon18UuROlqOW7NZ4xnCQiw0j8USmMok79vFdmIRDFfwAySLW4QdewvfylUQlzU
+# RrEw/sm4owsAUGyUt7zEGMloGlKuDArEjLcGfILLksNZFfmTdNp468FJTOOfn9idMdhRNT1QSLA5drt2KaSFOXRiwUdm1azUmBRt
+# FXWFyrCCHRaVHOv8okc4jhlNgoKsyrELq4uA01Fsnud5oQ12xCf8ChwV4+x06fxMPDHM01+ND48t4+wDVFr2GAJSRGxt2ZM4TKOf
+# KZjbwtya2SlKdUyxP0DaMQdr7XIzQ21uzaxfz8Tjs1P78dkHeFhC1OCasEKEm1DYXOl79vn015sPj89u8i5VoBenv54FHx7XYEW6
+# ophf6ClnDaMQlAK24LAvbh0dVsO0YHgrxw06RqeBkOcQx/2zWDobPblrBtB8Zj+pnYAPsihSP8EUleAoxUan2UbPrt3s4Fen1W3C
+# P3x8PNcTmYcokhkZNdwZ7rNVTgqArx7BiniJSuHNk3i6uPXhyRKRl/12JOsrTzNld08MwqSPOgXsDYivl1DWSc/h5pZR9XAwqbac
+# 3UET/hTWysjrSxQoTaVEDRncIPE0pLmTzw3ifINcHtUgn1UDODE4N1yvkjgXU5TzNqIgbkUb0WAhujETvM27zkyqQdOBCuVd4KEN
+# KTqec/aDcuxamstaPrKRPFhgtboWS6ZxeMn2IAiZOP52PEnxBlJm9kxjIM96BKObUvJoxUnY4euBbSgtgqXVAjUAi3xNJy8TIK5s
+# 0tCc5WZtjiZMuirVa0nQktEjgDmmVC4zoJTwAFECgHfk2pm8grcvTZfuNedJ0PTmYMmpLqZtQYEzkw675BrW5W7Dc+3WKKpG5HKY
+# wrrdqaAfXMyxNGVmw/P7N6cXpv4o+CFhmC2mladzuTNjSZwZYL7wZekzTRBcoL+hueliBvHGsusypdlqwk5LystApUnNym1yEPS7
+# 5hpwJ6g+26hi7q/IQBjopGiO6PIKy3LyYeCWuYk0LuEF2d/D9CgaKeaRz8Wa5fsSuSSZlJRtyJ64HHM5zZIfR2AlR2WOYHmcNw7r
+# WYfiMbPMaBB1Hae4yCMKScjtBK4E8w++mfYBCsA9CjW8IMkgAa4MJaMwgHIUiD6AyKIxE1RSTWXZvIGjkfScCC/IHn9KnThzMraY
+# FMuFshx4KAdyx8G2ey6vFQd9KMIvTr1qKhwPJzDTT+nrdrXdwche9aZkeh0QcfiGJKVuEHTZZTO6+jQlsEuFcKaa6ncCioFQxhFj
+# Dd1jPAgpuuhUM++nY+8q+jzRgcImO+bBCbqnmICz3/+4d9KvOYagK9KoHnI8Fji06tiiujyoc2gomVQfezFwaDxAH5dMZnRRrDOt
+# cqgH1MiYZx6vJ3bk7uEmPghJ9YwDbAUf9dBWKSq3bDdCq9qknYeXW/q8ze4P6HMdNcvMhKgKuqor10aixHcgjicw+SY4FTfVFbuM
+# 1Mx0IoFm6EY1OxkdEjkFWD2nKrAfCpQEU6FvZr318fF2ss9BCE3SA6XuoBj1HbmmcNzYG4O8gV5KuLyVZqJEFtKXNXq9zG7gdlPM
+# T+bBxtsf1S6uVAa39krCah9a452yoX9RqK0REJLrKqYwimrYnARjZ3+790bu6R2C4iQJOGZEfmF8QaptW7XtXOupNHBAC9mnvV+j
+# D9SSEzKNF5xSmRmaSdo2N9gyVFaOxEpATRlU5mu7IZMv9uBg0M/EWHbRQJbEXSELtNmnXLM9VLl54ogrzKgT5rW+PHM//lQVi4mj
+# d0QqEnImNlnHYjlHKyGQCr3zAYVGzgh4uspgvqjG7rqQtOAxrd2lYB3slq0y0nfAdjJYlea+A7a9qmHzFHo9+EuE7uKGFzhBphSK
+# Sger1FJgj2dtWaFUxCZUraxi1WJxC/TU9FlEhQKlZ6EfboCc5ercUM9vxUunFrfh1GP3j6sgxYkruOzcogKsEx004sHBqxJAjYZF
+# hXpMRvY240H6uZhKRFPaAHOFbjSGXUYFKfpuO6So3tdoDqXDFanqrRYHHSfUocjMlcShX+ssLs+Q5PZKz2oeLRghiZCsUR2yfFZE
+# 9+wPIxOXMl9moJu9DmEBZtkK69YoDmfdsN//4z8LQHJOjcL8rBujurmFU5YsSw6iPu8dYilxPqXkMhu2yP4apsDy4BClEbsO0xgo
+# oXy11KQ3eNV9CTVVgw3ThAIfdbHRxV+uxTNBdWAgHHYZxueC7jwZtTSQlND4dLJHKnWR7SXs0pFYzvm19DOnHGTr93/7L6p1MF0h
+# 798JdoktsxTiOxhN8FtGQlmTE0UBJJQam6T+BxgwjJg7DUHL3IIkE0TClJ0fEqaAO7F/jb9Yw5sLsNtqBsNsPHNJiZ9122qABMvF
+# CMORNC/sJF9e4XuTaQJjRDEf8xitmMZYg1Crhurma36ZYtwKPLmEbrcnYJvJQqJx2CiqfYsZDhuqU0iJdw5Q6XwCnKmDTZWsRdT5
+# sehNDaGaHGAAkXNuPdlYMlEsqv+8Eq/Lok42cwVQBCzU0tWbZvXXAsVioDDgbzzwx4gYf6EFAtvjntNgEIktfc7Gvm12WO6l5iXl
+# xu8m5mQK2+T44GWIeSKaOaq7yLibK3SR24H/JYXy4SqW4mHde+S50KPSm3f2wyIzOAXHMfN9KfHhJY2SV5kfLaFbfHumJ/f15rTz
+# fCEjl0PfO0/cfDnNuyzqA6c97+5nU64Eq/+I6d4jl7pkO79YdLHv421djEF4SXoTwoIwQOXqggqh5ObS5zm/hCKYhhxwcREsE/42
+# GCxtyWppcqy7xEIXvZt/jPSCrsAZuFMncOnC/qW6FK9IUqMoU/pZMc5p+4Mt0qGQsUSX7jM/gGQt0QZaiixtNwkTaQ4xYxygdxJw
+# PqIfSt+D83Z+qW+przWWyLrs8AQTSWjNM1PFlqSmr5JRRnWDp3xnAR7zkftUdnhq4idWCvAWywEexWy0VuWUGhaV8sMcQae9bHfW
+# 1vBOgr6lsLK8ugKv5Jc/xhNDDCYJ6nnh/jklEgvHibrIvOMpSu4H/KE8vL9Q+UVZ+eRJCV4mFWXTKZhYvFhqVitBatt0H7U8E8qJ
+# UsK3srjlG0LzRWbe4LOh0nZ0dl9KmOUvjVoU+U2hPHGBdT0knsf1nfQtIpVTzmRahqgu5kzLbm3hrR5j4ToRJTBz91lfJ8Kxbves
+# q1jLG3prPpoOOCopmLy2lIKpPw2hWh0B/U97V7PbRnKEc/ZTjAUbIiVqTMqyLFvWaiVK2gjRrgzTjg+GsRjxd+DhDHdIWtbaBPYJ
+# kluCze8tt+QY5Hn8AnmF1FfdPd09f6QCI7lMLXaX09N/011d1V39VckoWWSkrMNA24RxVp+wjJT0FVsWL6XoWtzPOxOXfzXE1TYn
+# 8K+GeemjfjZMiJRKf22Pn7rfYcZspFeGhknJb5YLo/lWbM7k4qHHB45+pewa+dUdy54b1bXs6lpGda2i6gwYFhhRLMAmOFNjr/QL
+# YtmkdBlkuaIvSCvjv00X5VtiwJfgvx/u7O4k+O/d7dYvmtuU9rjCf/8v6Jb+n8PYm4z87tR9TuwwK3wL6N3A0yBvlYH06jE7QaZe
+# 6AgjLkK78J5VMVtxVhXQJO6P+1CZF948pO7HZ1GsCr9gxMXyKqaIKcOurcV5BXqDXWARNcC122jL5GmmgmzQFrfthe+9lXJe0fwA
+# cxT2VsndDXyazquc8c3JTMcBGJU2VsmrhrjTjaMg6MxI1a9SbDryAPxEAkK5xSHVgKRVyr5HPMKuF4gmC0skMWxKPiSWvpDFOea+
+# exT4w3CcxwFGpm+jnj/wtfNyXp5e7F1jJiZlmYb9aNynA6t7ORgQ862UteP/WDxyyKiWXxvuAivlRF+n3YgmCb/Ow1m0hDXNwsJ4
+# uLyACprkXkQ0nynX8bwC7Co8oHzuGf3ndR8mu7L889Cfub3S8eYs04ntm4EctLZmfCN04k8nfCUST0tyBSxjSjJc+7OR+kTprG2q
+# TjhopyVc4u5leYJFYRvm3H5t6tFx4TwkPUUnYV568MCGFD00zdLT+aQfuyWlTIdQJe1Spgh1T8uRTWrsddJBZBds33pe/K6tUwC9
+# ytoxOvMYcr+m1glQccG33gewLpdwjiaTWho7t7hj/+JgXF9fTmZ0Jjz9QJ/lc1Sp4IIl1tHEf/qUR7Z+52sezCmLPAyaqF30i2/p
+# ZnCzNPnOpR1ujFWenBfA/mxhEyKureaygxfSSscQymHoXN0k+ehbJGqGRxeQxASSh+w08rP5tLSEBLMeflUT1/668NV8elPeGMOu
+# zCKArJW3Zh5dctqc9oPyJrdaibs1gxlI1/Chc6n+rRWoSvdy0g9Poi6jwgR7zGPfNBXhAIKkBBlhs5yNwFeEiTrA1KtwFRxn/D1W
+# B7V3rv32UXX97t2M+z6imypEptfDcTfLskVWQzntiB6usG1o1UEwVVxakcbCBmvYX6zl8D3/D4xMKsvyAmWGEKH19sVUixHZ52k7
+# cLZa+0bTHZwicVsmbj0+//Q3bSgS4l7IsZWGky3RDBJJJFvNEJbuiQi5mCcOQCpUxeyDGtd+mTEw8TNNEKcMMm04rR0Mb6/h8NWv
+# /lZRAB+bGO7u9Zxo4Nyb4btXtrhlU+Qwx8bIst3LKlXAB5nKdIc5LEWKFVJ1Dnz6qICt2WLe0yBLi19IKs/HoTZG5AtfV/Tg2Iun
+# z71eT2AtQu+9P/Rk1CqdbnUntROr5ewFae26E1m4tUuq2LAAqdLAAIYyxv+BYzy5HO0TcJbWti5aT2GCcfNroXIhGoYw5eQJBl6z
+# 6fhfDQd7CoyGg7Ce1K5IERsMhCpJHtzjKOjVc6p87k1nfccDfNiJYrG0PceFyOFwyc5pQdyySFrUJyPS/byWdByYNJb1co5tRZ8l
+# z5nfD3IskSL+xoFYGlHIHgntEYaUEj9KEYhr9KwpbizZg92PbE557fdmI2KLEQ8Cad+xj3q2m017ThWxqyo3KEfnm++gA+2M9re9
+# iK5royj2f4yg0Vdgij00nbeijuezWRTWaMeDUw/3QkjNRYPkHhQXjIh3eQXhmnAYClz+ceCF74S2Eb2WDJKB9JtTkdOY0H9SktYU
+# fnVt48EGwlVkO6EbvFQKIdOk/SRWrEJLcFnGkNjmavg+cfVwafJiBRY+B67Vm0VxZjMmZ9kwwgr7XRYAS3slZUileRZxJ4auAKtS
+# ylvjMiBddMBmTqrg0E3s04dPqbSyfObCV9gGyoVME7QuJ+ykd3IW5r2PQ2F3XTjvcQ0/FEbXxVr5GrdkQmuP2M5mV2GDZiQ1d2ve
+# 9e0M6BHJzprofQr6CGYvGP2Gs8oq6GAVkEgJg5sVl4DaDjgLzW+ff/uPXObOKW7PNf3a2rJq+v1Pt63pmeIYgbnbAuaO0jc3rXp/
+# 989V6xUfmK7T/ty/5yws67GNWS1aF3lYH6FikxKJshMa6zZKbrdInoH49g2LLl+tmSS+lXd6yc7HdZ5j6Ts0nLgyJVU1YReM+XCU
+# uLWklU0yQnlCwCQwc/KdyliCr1S/Xfwdnn78a5knuFmNx5dL+sxnL73QJXFAw+jq67SFBOZQook4W3MVxsZ13bWFI4pNvXAhfnUD
+# YjGO0WBA1kitIjoNAiVQDQrNQ7qWhM3SnplbkObSLUh5feUIEh4p9RGsqRsikAQ1wwf55CWn1m+zGTKp+LI76YFx4VjAfMvuse3l
+# exZE17feSOx+uaWqpM8gik+97sjy4BkXnW6S2B64jWbYv82K9z6OTYZ1HctXdwyudDYLx1rWqBk2h0fN1/nzUL66BBMVvlbMpXsS
+# xT2cZKBNbKhy8ubTJ8fO+uxAgxpVYl3y69jgVvFFnO6+CqeTfheSuWTB5Gx7S5cPm3BrWdu15Irystpsz/PiYzJIcakPQRCSh0f4
+# x/oO/sMpEw/mqSX1J4b+RCGmvVwyRZTK0muGSuFb9JKghJ38jT4o26XSNdqZj8defFMb5p9tcjR7rlnDVOxyo+54YUTaTJi8LE1v
+# mg9TlkG1T1NxNQwj4TXWvzI76PgbgIeRoPFmNRuisj2At9uTvYH4sJI9njxH1Vo7aUFyHH3Qha5Fruu6Kv5LkVA32UhwiPDRr5fW
+# 0xrAmWF5ZcyF20wq6EHuyCUTafvsqs9ZdSv1BbdQmeEEyf2Q6OySXX/eyf5IYh8YiKxPEzDUrN1HzAMVAmHoWqiL+uI+1aEPHGUF
+# GPFABVJbMHZJ7AKDCtEnQsXl70MVuw5dA1vxpiuwTLm5r4zc3Hxhbkbjk6a5EkCP/G0YcfuyPWlXbTayjFnP7ECkNC8Wd/J0d71m
+# 1sfctdMsF8Sy5NXtSi7fiWTbqAmIyydHzK9taCL+Ng+VhojKBK+QfmVG/Ap2nH3WHnkx//rKkFoxAMyM+NKIR+H8wEEnVfzJBzL+
+# pIQviVAxe5CpsblRYfgepkU1JfJQTcYX45YACD/NO4JzR2Bd9OdN/LYuzjAjBF/xhz6b9bsA7VGuLWe9uS79Gd90NzeBy+uOksq8
+# YhmUHMN1sAGAF1/pwDyHpkQfxn7PuJjgqDOw2BiDrNSGuL4slOAedhazF9i6gn/TVskpfNhwBhWc5Txw9gZWhkAKIC1xT49P2ycp
+# L2jcrVmZHj988ujRtp1pFBhZ9vbOHp+2Hz2xs3Ak7AM1NIcunAjOB+IqI+iHQ+ohbcV2nIWyKdFZBmgwmhhvHfhOp7bHXn4M6uLp
+# qtctBoDj3q1b2M5t4WFRC5gCaoMhJjX+r3v03cvz748uzo86359dHH1Td8Ufe/zo4DZCLjSaiw14rj0a7HMyn0tVPeJ6322f4s9O
+# 0HsJUKHXCqvinpyeHb26eJnqDBxR3vWT7qBvunX+OxBJEx08uZ2XLy5/dbovCzIf6c41d6hzSgRmYDNCxwsP0YW9xmIssaYDIEPg
+# 0NLUKsNItAUzbvRfEPPyDpQq2HS6dee+s80hhOqSM3kxgv0ajkAiUKUb1NsGiQf8nyQ2Xx8ghZ6yAXsFywFfi8mNOfYuWESn1HVP
+# RsF/0wxbIjGIWNYkYkiDZbpB7+8eQFwVac1hcDMZaZeukXYzhcjL17ag9XfrjAz//PMf1vad9R/U0x/xFKunP+HpSj39GU+hevoL
+# PSUA888//zUHsw2U9r//9ZvsG7Cba56rWLC+QiziNnvI1ou4iLGtUtbm54iHV7XtZsMR/2a1IUYNt+dipoAg/wHhN3Lz4Y4qNvKB
+# 1x8bolCRjTIpMoLNLGgJQ1NY0fIcNpwPDeemIddXvhJfrQZeyyure624/9+YvYoqqqiiiiqqqKKKKqqooooqqqiiiiqqqKKKKqqo
+# oooqqqiiiiqqqKKKKlL0H6w6VE0AoAAA
+#PAYLOAD_END
